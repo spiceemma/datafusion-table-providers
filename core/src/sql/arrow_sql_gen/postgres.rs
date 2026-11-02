@@ -297,6 +297,19 @@ enum NumericFit {
 /// # Errors
 ///
 /// Returns an error if there is a failure in converting the rows to a `RecordBatch`.
+/// Nanoseconds since the Unix epoch, negative for a time before it.
+///
+/// `SystemTime::duration_since` fails for a time before the epoch, so that case is the
+/// distance back to it. Skipping it instead leaves the column one value short of the
+/// others, and building the record batch then fails for every row read with it.
+fn unix_nanos(time: SystemTime) -> Result<i64> {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(after) => i64::try_from(after.as_nanos()),
+        Err(before) => i64::try_from(before.duration().as_nanos()).map(|nanos| -nanos),
+    }
+    .context(FailedToConvertU128toI64Snafu)
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Result<RecordBatch> {
     let mut arrow_fields: Vec<Option<Field>> = Vec::new();
@@ -711,15 +724,7 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                         })?;
 
                     match v {
-                        Some(v) => {
-                            if let Ok(v) = v.duration_since(UNIX_EPOCH) {
-                                let timestamp: i64 = v
-                                    .as_nanos()
-                                    .try_into()
-                                    .context(FailedToConvertU128toI64Snafu)?;
-                                builder.append_value(timestamp);
-                            }
-                        }
+                        Some(v) => builder.append_value(unix_nanos(v)?),
                         None => builder.append_null(),
                     }
                 }
@@ -1925,6 +1930,16 @@ mod tests {
     use geo_types::{point, polygon, Geometry};
     use geozero::{CoordDimensions, ToWkb};
     use std::str::FromStr;
+
+    /// 1969-12-31 23:59:59.5 is half a second before the epoch, not an error and not a
+    /// skipped value.
+    #[test]
+    fn unix_nanos_is_negative_before_the_epoch() {
+        let half = std::time::Duration::from_millis(500);
+        assert_eq!(unix_nanos(UNIX_EPOCH - half).expect("before"), -500_000_000);
+        assert_eq!(unix_nanos(UNIX_EPOCH).expect("epoch"), 0);
+        assert_eq!(unix_nanos(UNIX_EPOCH + half).expect("after"), 500_000_000);
+    }
 
     /// Big-endian 16-bit words, the way `numeric_send` lays a value out.
     fn numeric_wire(words: &[u16]) -> Vec<u8> {
